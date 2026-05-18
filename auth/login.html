@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Connect to Redmine</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 420px; margin: 80px auto; padding: 0 20px; }
+    h2 { margin-bottom: 4px; }
+    p.subtitle { color: #666; margin-top: 0; margin-bottom: 24px; font-size: 14px; }
+    label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; color: #333; }
+    input { width: 100%; box-sizing: border-box; padding: 8px 10px; border: 1px solid #ccc;
+            border-radius: 6px; font-size: 14px; margin-bottom: 16px; }
+    input:focus { outline: none; border-color: #555; }
+    button { width: 100%; padding: 10px; background: #1a1a1a; color: white;
+             border: none; border-radius: 6px; font-size: 15px; cursor: pointer; }
+    button:hover { background: #333; }
+    .hint { font-size: 12px; color: #888; margin-top: -12px; margin-bottom: 16px; }
+    .error { color: #c00; font-size: 13px; margin-bottom: 16px; padding: 8px 10px;
+             background: #fff0f0; border-radius: 6px; border: 1px solid #fcc; }
+  </style>
+</head>
+<body>
+  <h2>Connect to Redmine</h2>
+  <p class="subtitle">Enter your Redmine URL and API key to continue.</p>
+
+  {% if error %}
+  <div class="error">{{ error }}</div>
+  {% endif %}
+
+  <form method="POST" action="/auth/login">
+    <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
+    <input type="hidden" name="state" value="{{ state }}">
+
+    <label for="redmine_url">Redmine URL</label>
+    <input type="url" id="redmine_url" name="redmine_url"
+           placeholder="https://redmine.example.com"
+           value="{{ redmine_url }}" required>
+
+    <label for="api_key">API Key</label>
+    <input type="password" id="api_key" name="api_key" required
+           placeholder="Your key from My Account → API access key">
+    <p class="hint">Find it at <em>My Account → API access key</em> in Redmine.</p>
+
+    <button type="submit">Connect</button>
+  </form>
+</body>
+</html>
