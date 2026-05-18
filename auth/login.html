@@ -31,6 +31,8 @@
   <form method="POST" action="/auth/login">
     <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
     <input type="hidden" name="state" value="{{ state }}">
+    <input type="hidden" name="code_challenge" value="{{ code_challenge }}">
+    <input type="hidden" name="code_challenge_method" value="{{ code_challenge_method }}">
 
     <label for="redmine_url">Redmine URL</label>
     <input type="url" id="redmine_url" name="redmine_url"

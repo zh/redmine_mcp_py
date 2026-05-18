@@ -4,3 +4,4 @@ __pycache__
 .claude
 .DS_Store
 .env
+auth/__pycache__
