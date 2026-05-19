@@ -10,7 +10,7 @@ pinned: false
 
 # Redmine MCP OAuth Server
 
-Python FastMCP HTTP server wrapping [zh/redmine_mcp_server](https://github.com/zh/redmine_mcp_server) tools,
+Python FastMCP HTTP server wrapping the Redmine REST API as MCP tools,
 with a minimal OAuth 2.1 Authorization Code flow backed by Redmine API key validation (Option B).
 
 ## Auth flow
@@ -49,7 +49,7 @@ Settings → Connectors → Add custom connector → `https://your-server/mcp`
 OAuth Client ID and Secret can be left blank (public client, no secret needed
 with this implementation).
 
-## Tools implemented (53 from zh/redmine_mcp_server)
+## Tools implemented (53 Redmine API endpoints)
 
 - Projects: list, get, create, update, delete
 - Issues: list, get, create, update, delete, watchers, relations, journals, copy, move
