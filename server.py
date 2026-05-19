@@ -17,9 +17,18 @@ from fastapi import FastAPI
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_access_token
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
+from auth.security import (
+    InvalidRedmineURL,
+    SECURITY_HEADERS,
+    validate_redmine_url,
+)
 from auth.store import lookup_token, UserSession
 from auth.routes import router as auth_router
+from config import settings
 
 
 # ---------------------------------------------------------------------------
@@ -74,9 +83,22 @@ async def _redmine(
     params: dict = None,
     json: dict = None,
 ) -> Any:
-    url = f"{session.redmine_url}{path}"
-    headers = {"X-Redmine-API-Key": session.redmine_api_key, "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=30) as client:
+    # Defense-in-depth: re-validate the stored base URL on every call so a
+    # session minted under older / looser code can't continue exfiltrating.
+    try:
+        safe_base = validate_redmine_url(session.redmine_url)
+    except InvalidRedmineURL as e:
+        raise PermissionError(f"Refusing outbound call: {e}") from e
+
+    url = f"{safe_base}{path}"
+    headers = {
+        "X-Redmine-API-Key": session.redmine_api_key.reveal(),
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(
+        timeout=settings.redmine_timeout_seconds,
+        follow_redirects=False,
+    ) as client:
         resp = await client.request(method, url, headers=headers, params=params, json=json)
     resp.raise_for_status()
     if resp.content:
@@ -219,8 +241,10 @@ async def update_issue(issue_id: int, updates: dict[str, Any], notes: Optional[s
 
 
 @mcp.tool()
-async def delete_issue(issue_id: int) -> dict:
-    """Delete a Redmine issue."""
+async def delete_issue(issue_id: int, confirm: bool = False) -> dict:
+    """Delete a Redmine issue. confirm must be true."""
+    if not confirm:
+        return {"error": "Set confirm=true to delete the issue."}
     s = _session()
     return await _redmine("DELETE", s, f"/issues/{issue_id}.json")
 
@@ -261,8 +285,10 @@ async def create_issue_relation(
 
 
 @mcp.tool()
-async def delete_issue_relation(relation_id: int) -> dict:
-    """Delete a Redmine issue relation."""
+async def delete_issue_relation(relation_id: int, confirm: bool = False) -> dict:
+    """Delete a Redmine issue relation. confirm must be true."""
+    if not confirm:
+        return {"error": "Set confirm=true to delete the issue relation."}
     s = _session()
     return await _redmine("DELETE", s, f"/relations/{relation_id}.json")
 
@@ -357,8 +383,10 @@ async def update_user(user_id: int, updates: dict[str, Any]) -> dict:
 
 
 @mcp.tool()
-async def delete_user(user_id: int) -> dict:
-    """Delete a Redmine user (requires admin)."""
+async def delete_user(user_id: int, confirm: bool = False) -> dict:
+    """Delete a Redmine user (requires admin). confirm must be true."""
+    if not confirm:
+        return {"error": "Set confirm=true to delete the user."}
     s = _session()
     return await _redmine("DELETE", s, f"/users/{user_id}.json")
 
@@ -420,8 +448,10 @@ async def update_time_entry(time_entry_id: int, updates: dict[str, Any]) -> dict
 
 
 @mcp.tool()
-async def delete_time_entry(time_entry_id: int) -> dict:
-    """Delete a Redmine time entry."""
+async def delete_time_entry(time_entry_id: int, confirm: bool = False) -> dict:
+    """Delete a Redmine time entry. confirm must be true."""
+    if not confirm:
+        return {"error": "Set confirm=true to delete the time entry."}
     s = _session()
     return await _redmine("DELETE", s, f"/time_entries/{time_entry_id}.json")
 
@@ -462,8 +492,10 @@ async def update_membership(membership_id: int, role_ids: list[int]) -> dict:
 
 
 @mcp.tool()
-async def delete_membership(membership_id: int) -> dict:
-    """Remove a user from a Redmine project."""
+async def delete_membership(membership_id: int, confirm: bool = False) -> dict:
+    """Remove a user from a Redmine project. confirm must be true."""
+    if not confirm:
+        return {"error": "Set confirm=true to delete the membership."}
     s = _session()
     return await _redmine("DELETE", s, f"/memberships/{membership_id}.json")
 
@@ -507,8 +539,10 @@ async def update_group(group_id: int, name: Optional[str] = None, user_ids: Opti
 
 
 @mcp.tool()
-async def delete_group(group_id: int) -> dict:
-    """Delete a Redmine group."""
+async def delete_group(group_id: int, confirm: bool = False) -> dict:
+    """Delete a Redmine group. confirm must be true."""
+    if not confirm:
+        return {"error": "Set confirm=true to delete the group."}
     s = _session()
     return await _redmine("DELETE", s, f"/groups/{group_id}.json")
 
@@ -556,8 +590,10 @@ async def update_version(version_id: int, updates: dict[str, Any]) -> dict:
 
 
 @mcp.tool()
-async def delete_version(version_id: int) -> dict:
-    """Delete a Redmine version."""
+async def delete_version(version_id: int, confirm: bool = False) -> dict:
+    """Delete a Redmine version. confirm must be true."""
+    if not confirm:
+        return {"error": "Set confirm=true to delete the version."}
     s = _session()
     return await _redmine("DELETE", s, f"/versions/{version_id}.json")
 
@@ -591,5 +627,33 @@ async def list_queries(limit: int = 25, offset: int = 0) -> dict:
 mcp_app = mcp.http_app(path="/", transport="streamable-http")
 
 app = FastAPI(title="Redmine MCP OAuth Server", lifespan=mcp_app.lifespan)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Apply a baseline set of security headers to every response."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        for k, v in SECURITY_HEADERS.items():
+            response.headers.setdefault(k, v)
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
 app.include_router(auth_router)
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz() -> dict:
+    """Liveness probe. 200 means the process is up."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz", include_in_schema=False)
+async def readyz() -> dict:
+    """Readiness probe. Currently identical to healthz; will check the token
+    store backend once a remote backend is wired up (Phase 1.1)."""
+    return {"status": "ready"}
+
+
 app.mount("/mcp", mcp_app)

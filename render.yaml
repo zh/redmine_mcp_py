@@ -1,0 +1,58 @@
+# Render blueprint — https://render.com/docs/blueprint-spec
+#
+# Commit this file to the repo, then in the Render dashboard click
+# "New +" → "Blueprint" → connect this repo → Apply. Render reads this
+# file and provisions the service. Secrets marked `sync: false` must be
+# filled in afterwards in the service's "Environment" tab.
+
+services:
+  - type: web
+    name: redmine-mcp
+    runtime: docker
+    region: singapore       # change to frankfurt / singapore / ohio as needed
+    plan: free              # "free" sleeps after 15 min idle (kills in-memory
+                            # tokens); "starter" ($7/mo) stays always-on
+    branch: main
+    autoDeploy: true
+    healthCheckPath: /healthz
+
+    envVars:
+      # Signs CSRF cookies. generateValue=true means Render mints a 256-bit
+      # random value once and reuses it across deploys. Rotate by clearing
+      # the env var and redeploying.
+      - key: REDMINE_MCP_SECRET
+        generateValue: true
+
+      # We sit behind Render's reverse proxy → trust X-Forwarded-For.
+      - key: REDMINE_MCP_TRUST_PROXY
+        value: "true"
+
+      # Access-token lifetime (seconds). 24h default.
+      - key: REDMINE_MCP_TOKEN_TTL_SECONDS
+        value: "86400"
+
+      # Authorization-code lifetime (seconds).
+      - key: REDMINE_MCP_CODE_TTL_SECONDS
+        value: "300"
+
+      # Outbound Redmine HTTP timeout.
+      - key: REDMINE_MCP_TIMEOUT_SECONDS
+        value: "30"
+
+      # CSV allowlist of Redmine hostnames the server will talk to.
+      # STRONG RECOMMENDATION: set this to the specific Redmine instances
+      # your users are allowed to connect to, e.g. "redmine.acme.com".
+      # Leave empty to allow any public hostname (SSRF defense still blocks
+      # private/loopback/link-local addresses).
+      - key: REDMINE_MCP_ALLOWED_HOSTS
+        sync: false
+
+      # CSV allowlist of OAuth redirect_uri values for clients that did NOT
+      # register via /oauth/register. Leave empty if you only support
+      # DCR-capable MCP clients (Claude Desktop, the Claude Code SDK, etc.).
+      - key: REDMINE_MCP_ALLOWED_REDIRECTS
+        sync: false
+
+      # NEVER set true in production — only for local dev.
+      # - key: REDMINE_MCP_ALLOW_HTTP
+      #   value: "false"
