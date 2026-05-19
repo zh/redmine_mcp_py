@@ -127,12 +127,17 @@ SECURITY_HEADERS: dict[str, str] = {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "Permissions-Policy": "()",
+    # form-action applies to the *entire* redirect chain of a form submission,
+    # so it must permit the OAuth callback target — RFC 8252 loopback for
+    # desktop MCP clients (random port), or any HTTPS for web clients. The
+    # actual redirect_uri is still server-validated by _redirect_uri_is_allowed.
     "Content-Security-Policy": (
         "default-src 'self'; "
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; "
         "frame-ancestors 'none'; "
         "base-uri 'self'; "
-        "form-action 'self'"
+        "form-action 'self' "
+        "http://127.0.0.1:* http://localhost:* http://[::1]:* https:"
     ),
 }
