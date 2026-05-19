@@ -1,3 +1,13 @@
+---
+title: Redmine MCP
+emoji: <F0><9F><94><A7>
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Redmine MCP OAuth Server
 
 A FastMCP HTTP server that exposes 53 Redmine REST endpoints as
