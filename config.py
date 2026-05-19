@@ -11,6 +11,11 @@ import secrets
 from dataclasses import dataclass, field
 
 
+# Project version — tracks the TODO.md plan phase number. Bump whenever a
+# new phase lands, alongside the Dockerfile LABEL and docker-compose tag.
+VERSION = "1.7"
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     val = os.getenv(name)
     if val is None:
@@ -72,6 +77,40 @@ class Settings:
     # Per-request timeout for outbound Redmine HTTP calls.
     redmine_timeout_seconds: int = field(
         default_factory=lambda: _env_int("REDMINE_MCP_TIMEOUT_SECONDS", 30)
+    )
+
+    # Redis URL. Empty = use in-memory token store (single-process default).
+    redis_url: str = field(default_factory=lambda: os.getenv("REDMINE_MCP_REDIS_URL", ""))
+
+    # Fernet key for at-rest encryption of API keys when using a remote store.
+    # Generate with: python -c "from cryptography.fernet import Fernet; \
+    #                            print(Fernet.generate_key().decode())"
+    fernet_key: str = field(default_factory=lambda: os.getenv("REDMINE_MCP_FERNET_KEY", ""))
+
+    # DCR client record TTL. Long-lived; refreshed on each /oauth/register.
+    client_ttl_seconds: int = field(
+        default_factory=lambda: _env_int("REDMINE_MCP_CLIENT_TTL_SECONDS", 86400 * 30)
+    )
+
+    # Refresh-token TTL (seconds). Default: 30 days. Refresh tokens roll —
+    # using one mints a new one with a fresh TTL — so the wall-clock lifetime
+    # for an active client is effectively unlimited; only inactivity logs out.
+    refresh_ttl_seconds: int = field(
+        default_factory=lambda: _env_int("REDMINE_MCP_REFRESH_TTL_SECONDS", 86400 * 30)
+    )
+
+    # Rate-limit knobs. Per IP + endpoint, fixed window.
+    rate_login_per_minute: int = field(
+        default_factory=lambda: _env_int("REDMINE_MCP_RATE_LOGIN_PER_MIN", 5)
+    )
+    rate_login_per_hour: int = field(
+        default_factory=lambda: _env_int("REDMINE_MCP_RATE_LOGIN_PER_HOUR", 20)
+    )
+    rate_token_per_minute: int = field(
+        default_factory=lambda: _env_int("REDMINE_MCP_RATE_TOKEN_PER_MIN", 10)
+    )
+    rate_register_per_minute: int = field(
+        default_factory=lambda: _env_int("REDMINE_MCP_RATE_REGISTER_PER_MIN", 5)
     )
 
 

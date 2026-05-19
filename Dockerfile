@@ -1,5 +1,13 @@
 FROM python:3.12-slim
 
+# Version tracks the TODO.md plan phase number. Bump in lockstep with
+# config.VERSION and docker-compose.yml's image tag.
+ARG VERSION=1.7
+LABEL org.opencontainers.image.title="redmine-mcp" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="https://github.com/zhware/redmine_mcp_py" \
+      org.opencontainers.image.licenses="MIT"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \

@@ -19,7 +19,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: redmine-mcp:local
+      args:
+        # Bump in lockstep with config.VERSION and the Dockerfile LABEL when
+        # a new plan phase lands.
+        VERSION: "1.7"
+    image: redmine-mcp:1.7
     container_name: redmine-mcp
     restart: unless-stopped
 
@@ -50,10 +54,21 @@ services:
       # Set true only when a reverse proxy sits in front of this container.
       REDMINE_MCP_TRUST_PROXY: "${REDMINE_MCP_TRUST_PROXY:-false}"
 
+      # ---- persistent state (optional) -----------------------------------
+      # Leave empty to use the in-memory store (sessions lost on restart).
+      # Set to redis://redis:6379/0 + run `docker compose --profile redis up`
+      # to enable the redis-backed store with Fernet at-rest encryption.
+      REDMINE_MCP_REDIS_URL: "${REDMINE_MCP_REDIS_URL:-}"
+
+      # Required when REDMINE_MCP_REDIS_URL is set. Generate with:
+      #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      REDMINE_MCP_FERNET_KEY: "${REDMINE_MCP_FERNET_KEY:-}"
+
       # ---- lifetimes -----------------------------------------------------
-      REDMINE_MCP_TOKEN_TTL_SECONDS: "${REDMINE_MCP_TOKEN_TTL_SECONDS:-86400}"
-      REDMINE_MCP_CODE_TTL_SECONDS:  "${REDMINE_MCP_CODE_TTL_SECONDS:-300}"
-      REDMINE_MCP_TIMEOUT_SECONDS:   "${REDMINE_MCP_TIMEOUT_SECONDS:-30}"
+      REDMINE_MCP_TOKEN_TTL_SECONDS:  "${REDMINE_MCP_TOKEN_TTL_SECONDS:-86400}"
+      REDMINE_MCP_CODE_TTL_SECONDS:   "${REDMINE_MCP_CODE_TTL_SECONDS:-300}"
+      REDMINE_MCP_TIMEOUT_SECONDS:    "${REDMINE_MCP_TIMEOUT_SECONDS:-30}"
+      REDMINE_MCP_CLIENT_TTL_SECONDS: "${REDMINE_MCP_CLIENT_TTL_SECONDS:-2592000}"
 
       # ---- internal ------------------------------------------------------
       # uvicorn listen port inside the container — keep at 7860.
@@ -66,6 +81,10 @@ services:
       retries: 3
       start_period: 10s
 
+    # The `redis` profile starts a sibling redis service. If the app comes
+    # up before redis is ready, `restart: unless-stopped` will retry — within
+    # a few seconds the redis healthcheck passes and the app stays up.
+    #
     # Useful when running a Redmine container alongside this one: use the
     # service name as hostname (e.g. http://redmine:3000). Uncomment to wire
     # up your own Redmine container later.
@@ -77,3 +96,24 @@ services:
     # works on macOS and Windows; on Linux add:
     # extra_hosts:
     #   - "host.docker.internal:host-gateway"
+
+  # Opt-in Redis backend. Run with:
+  #   docker compose --profile redis up --build
+  # and set REDMINE_MCP_REDIS_URL=redis://redis:6379/0 +
+  #         REDMINE_MCP_FERNET_KEY=<value> in your .env.
+  redis:
+    image: redis:7-alpine
+    container_name: redmine-mcp-redis
+    profiles: ["redis"]
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:

@@ -20,7 +20,7 @@ from auth.security import (
     validate_redmine_url,
 )
 from auth import store as store_mod
-from auth import routes as routes_mod
+from auth.token_store import get_store
 from server import app
 
 
@@ -274,20 +274,21 @@ def test_login_rejects_mismatched_csrf():
 # 0.6 Token expiry
 # ---------------------------------------------------------------------------
 
-def test_lookup_token_returns_none_when_expired(monkeypatch):
-    from auth.security import RedactedStr as _RS
+@pytest.mark.asyncio
+async def test_store_drops_expired_sessions():
+    """Expired sessions vanish from the store on the next get_session."""
     sess = store_mod.UserSession(
         redmine_url="https://redmine.example.com",
-        redmine_api_key=_RS("k"),
+        redmine_api_key=RedactedStr("k"),
         redmine_user_id=1,
         redmine_login="u",
+        expires_at=1.0,  # already in the past
     )
-    token, _ttl = store_mod.issue_token(sess)
-    # Force expiry by rewinding expires_at to the past.
-    store_mod._sessions[token].expires_at = 1.0
-    assert store_mod.lookup_token(token) is None
-    # And the expired entry got pruned.
-    assert token not in store_mod._sessions
+    store = get_store()
+    await store.put_session("tok-abc", sess)
+    assert await store.get_session("tok-abc") is None
+    # And asking again still returns None (entry was pruned).
+    assert await store.get_session("tok-abc") is None
 
 
 # ---------------------------------------------------------------------------
@@ -321,10 +322,11 @@ def test_user_session_repr_does_not_leak_api_key():
 @pytest.mark.asyncio
 async def test_delete_issue_requires_confirm():
     from server import delete_issue
-    result = await delete_issue(issue_id=42)
-    assert isinstance(result, dict)
-    assert "error" in result
-    assert "confirm" in result["error"].lower()
+    from errors import ConfirmationRequired
+
+    with pytest.raises(ConfirmationRequired) as exc:
+        await delete_issue(issue_id=42)
+    assert "confirm" in str(exc.value).lower()
 
 
 # ---------------------------------------------------------------------------

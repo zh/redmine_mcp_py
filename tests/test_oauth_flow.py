@@ -22,18 +22,7 @@ def _pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
-@pytest.fixture(autouse=True)
-def _reset_state():
-    """Clear in-process auth state between tests so they don't leak."""
-    from auth import routes as routes_mod
-    from auth import store as store_mod
-    routes_mod._pending_codes.clear()
-    routes_mod._clients.clear()
-    store_mod._sessions.clear()
-    yield
-    routes_mod._pending_codes.clear()
-    routes_mod._clients.clear()
-    store_mod._sessions.clear()
+# conftest's _fresh_token_store fixture already resets all auth state per test.
 
 
 def test_full_oauth_flow(monkeypatch):

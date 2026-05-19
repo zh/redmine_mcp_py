@@ -10,7 +10,9 @@ Endpoints:
   POST /oauth/revoke    — RFC 7009 token revocation
   POST /oauth/register  — RFC 7591 Dynamic Client Registration
 
-Authorization codes are single-use, in-memory, and expire after CODE_TTL.
+All persistence (sessions, codes, clients) goes through `auth.token_store`,
+which is in-memory by default and Redis-backed when REDMINE_MCP_REDIS_URL is
+set.
 """
 from __future__ import annotations
 
@@ -23,28 +25,19 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode, urlparse
 
-log = logging.getLogger("redmine_mcp.auth")
-
 from fastapi import APIRouter, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from auth.store import (
-    issue_token,
-    purge_expired,
-    revoke_token,
-    validate_redmine_credentials,
-)
+from audit import audit
+from auth.store import UserSession, validate_redmine_credentials
+from auth.token_store import get_store
 from config import settings
 
+log = logging.getLogger("redmine_mcp.auth")
+
 router = APIRouter()
-
-# code -> {session, expires_at, redirect_uri, code_challenge, code_challenge_method, client_id}
-_pending_codes: dict[str, dict] = {}
-
-# client_id -> {redirect_uris, created_at, metadata}
-_clients: dict[str, dict] = {}
 
 _CSRF_COOKIE_NAME = "redmine_mcp_csrf"
 _CSRF_MAX_AGE = 600  # 10 min; longer than auth-code TTL is fine
@@ -63,14 +56,6 @@ _TEMPLATE = _JINJA_ENV.get_template("login.html")
 # helpers
 # ---------------------------------------------------------------------------
 
-def _purge_codes(now: Optional[float] = None) -> None:
-    """Drop expired auth codes to keep the dict bounded."""
-    cutoff = now or time.time()
-    expired = [c for c, e in _pending_codes.items() if cutoff > e["expires_at"]]
-    for c in expired:
-        _pending_codes.pop(c, None)
-
-
 def _verify_pkce_s256(stored_challenge: str, verifier: str) -> bool:
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
     computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
@@ -80,17 +65,14 @@ def _verify_pkce_s256(stored_challenge: str, verifier: str) -> bool:
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
 
-def _redirect_uri_is_allowed(redirect_uri: str, client_id: str) -> bool:
+async def _redirect_uri_is_allowed(redirect_uri: str, client_id: str) -> bool:
     """Decide whether a redirect_uri may receive an authorization code.
 
     Accepted in this order:
       1. RFC 8252 loopback (http://127.0.0.1:<port>/..., localhost, ::1) — used
          by every desktop MCP client (Claude Desktop, Claude Code SDK, ...).
-         The auth code lands on the victim's own machine, so this is safe and
-         standard. Required to survive HF Spaces / Render cold restarts that
-         wipe in-memory DCR state.
       2. Exact match against the client's registered redirect_uris (set at
-         /oauth/register).
+         /oauth/register, persisted in the token store).
       3. Exact match against REDMINE_MCP_ALLOWED_REDIRECTS env allowlist.
     """
     if not redirect_uri:
@@ -104,8 +86,10 @@ def _redirect_uri_is_allowed(redirect_uri: str, client_id: str) -> bool:
     if scheme == "http" and host in _LOOPBACK_HOSTS:
         return True  # RFC 8252 §7.3
 
-    if client_id and client_id in _clients:
-        return redirect_uri in _clients[client_id]["redirect_uris"]
+    if client_id:
+        record = await get_store().get_client(client_id)
+        if record and redirect_uri in record.get("redirect_uris", []):
+            return True
 
     return redirect_uri in settings.allowed_redirects
 
@@ -133,6 +117,58 @@ def _client_ip(request: Request) -> str:
         if xri:
             return xri.strip()
     return request.client.host if request.client else "?"
+
+
+async def _check_rate_limit(
+    request: Request, name: str, limit: int, window_seconds: int
+) -> Optional[JSONResponse]:
+    """Bump the (name, ip) counter; return a 429 response when over limit, else None."""
+    ip = _client_ip(request)
+    key = f"{name}:{window_seconds}:{ip}"
+    count = await get_store().incr_rate(key, window_seconds)
+    if count > limit:
+        audit(
+            "rate_limit_exceeded",
+            level=logging.WARNING,
+            endpoint=name, ip=ip, count=count, limit=limit, window_s=window_seconds,
+        )
+        retry_after = str(window_seconds)
+        resp = JSONResponse(
+            {"error": "too_many_requests", "error_description": "rate limit exceeded"},
+            status_code=429,
+        )
+        resp.headers["Retry-After"] = retry_after
+        return resp
+    return None
+
+
+async def _issue_token_pair(session: UserSession) -> tuple[str, str, int]:
+    """Mint a fresh access token + refresh token bound to `session`.
+
+    Refresh tokens roll: each successful refresh issues a brand-new one with
+    a fresh `expires_at`, so the previous one (already consumed via `pop_refresh`)
+    cannot be replayed.
+    """
+    now = time.time()
+    access_ttl = settings.token_ttl_seconds
+    refresh_ttl = settings.refresh_ttl_seconds
+
+    session.expires_at = now + access_ttl
+    access_token = secrets.token_urlsafe(32)
+
+    refresh_session = UserSession(
+        redmine_url=session.redmine_url,
+        redmine_api_key=session.redmine_api_key,
+        redmine_user_id=session.redmine_user_id,
+        redmine_login=session.redmine_login,
+        expires_at=now + refresh_ttl,
+    )
+    refresh_token = secrets.token_urlsafe(48)
+
+    store = get_store()
+    await store.put_session(access_token, session)
+    await store.put_refresh(refresh_token, refresh_session)
+    return access_token, refresh_token, access_ttl
 
 
 def _render_form(
@@ -184,35 +220,29 @@ async def authorize(
     code_challenge: str = "",
     code_challenge_method: str = "",
 ):
-    # OAuth 2.1: only "code" is supported.
     if response_type != "code":
         return JSONResponse(
             {"error": "unsupported_response_type"}, status_code=400
         )
 
-    # Mandatory PKCE — RFC 7636 §4, OAuth 2.1 §4.1.
     if not code_challenge:
         return JSONResponse(
             {"error": "invalid_request", "error_description": "code_challenge is required"},
             status_code=400,
         )
-    # We only accept S256. "plain" was removed in OAuth 2.1.
     if code_challenge_method and code_challenge_method != "S256":
         return JSONResponse(
             {"error": "invalid_request", "error_description": "only S256 is supported"},
             status_code=400,
         )
 
-    # State strongly recommended; we require non-empty to prevent CSRF on the
-    # client side (the MCP client correlates state).
     if not state:
         return JSONResponse(
             {"error": "invalid_request", "error_description": "state is required"},
             status_code=400,
         )
 
-    # Redirect-URI must be registered (or on env allowlist for legacy clients).
-    if not _redirect_uri_is_allowed(redirect_uri, client_id):
+    if not await _redirect_uri_is_allowed(redirect_uri, client_id):
         return JSONResponse(
             {
                 "error": "invalid_request",
@@ -248,15 +278,25 @@ async def login(
     client_id: str = Form(""),
     csrf_token: str = Form(""),
 ):
+    # Two-layer rate limit: short-burst + long-window. A casual user retrying
+    # after a typo will never hit either; a brute-force script will.
+    rl = await _check_rate_limit(request, "login", settings.rate_login_per_minute, 60)
+    if rl is not None:
+        return rl
+    rl = await _check_rate_limit(request, "login", settings.rate_login_per_hour, 3600)
+    if rl is not None:
+        return rl
+
     cookie_csrf = request.cookies.get(_CSRF_COOKIE_NAME, "")
 
     def _form_error(message: str, *, log_reason: str) -> HTMLResponse:
-        log.warning(
-            "login rejected: %s (ip=%s, client_id=%s, redirect_uri=%s)",
-            log_reason,
-            _client_ip(request),
-            client_id or "-",
-            redirect_uri or "-",
+        audit(
+            "login_rejected",
+            level=logging.WARNING,
+            reason=log_reason,
+            ip=_client_ip(request),
+            client_id=client_id or "-",
+            redirect_uri=redirect_uri or "-",
         )
         return _render_form(
             redirect_uri=redirect_uri,
@@ -270,7 +310,6 @@ async def login(
             status_code=400,
         )
 
-    # Anti-CSRF: form token must match cookie *and* be a valid signed token.
     if (
         not csrf_token
         or not cookie_csrf
@@ -282,7 +321,6 @@ async def login(
             log_reason="csrf_check_failed",
         )
 
-    # PKCE still mandatory at this stage (the form carries it through).
     if not code_challenge:
         return _form_error(
             "Missing PKCE challenge — please restart the OAuth flow from the client.",
@@ -294,8 +332,7 @@ async def login(
             log_reason="bad_pkce_method",
         )
 
-    # Redirect-URI must still match the registered list.
-    if not _redirect_uri_is_allowed(redirect_uri, client_id):
+    if not await _redirect_uri_is_allowed(redirect_uri, client_id):
         return _form_error(
             "This client's callback URL is not allowed. If the server restarted, "
             "restart the OAuth flow from your MCP client.",
@@ -304,7 +341,6 @@ async def login(
 
     session = await validate_redmine_credentials(redmine_url, api_key)
     if session is None:
-        # Re-render the form with a fresh CSRF token so the user can retry.
         return _render_form(
             redirect_uri=redirect_uri,
             state=state,
@@ -317,23 +353,25 @@ async def login(
             status_code=400,
         )
 
-    _purge_codes()
+    store = get_store()
+    await store.purge_expired_codes()
+
     code = secrets.token_urlsafe(24)
-    _pending_codes[code] = {
+    await store.put_code(code, {
         "session": session,
         "redirect_uri": redirect_uri,
         "client_id": client_id,
         "expires_at": time.time() + settings.code_ttl_seconds,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
-    }
+    })
 
-    log.info(
-        "login ok: login=%s ip=%s client_id=%s redirect_uri=%s",
-        session.redmine_login,
-        _client_ip(request),
-        client_id or "-",
-        redirect_uri,
+    audit(
+        "login_ok",
+        login=session.redmine_login,
+        ip=_client_ip(request),
+        client_id=client_id or "-",
+        redirect_uri=redirect_uri,
     )
 
     params = {"code": code, "state": state}
@@ -346,41 +384,63 @@ async def login(
 
 @router.post("/oauth/token")
 async def token(
+    request: Request,
     grant_type: str = Form(...),
     code: Optional[str] = Form(None),
     redirect_uri: Optional[str] = Form(None),
     client_id: Optional[str] = Form(None),
     code_verifier: Optional[str] = Form(None),
+    refresh_token: Optional[str] = Form(None),
 ):
-    if grant_type != "authorization_code":
-        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+    rl = await _check_rate_limit(request, "token", settings.rate_token_per_minute, 60)
+    if rl is not None:
+        return rl
 
-    if not code or code not in _pending_codes:
+    if grant_type == "authorization_code":
+        return await _grant_authorization_code(
+            code=code,
+            redirect_uri=redirect_uri,
+            client_id=client_id,
+            code_verifier=code_verifier,
+        )
+    if grant_type == "refresh_token":
+        return await _grant_refresh_token(refresh_token=refresh_token)
+    return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+
+async def _grant_authorization_code(
+    *,
+    code: Optional[str],
+    redirect_uri: Optional[str],
+    client_id: Optional[str],
+    code_verifier: Optional[str],
+) -> JSONResponse:
+    if not code:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
-    entry = _pending_codes.pop(code)
+    store = get_store()
+    entry = await store.pop_code(code)
+    if entry is None:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
     if time.time() > entry["expires_at"]:
         return JSONResponse(
             {"error": "invalid_grant", "error_description": "code expired"},
             status_code=400,
         )
 
-    # redirect_uri must match the one used when the code was issued.
     if (redirect_uri or "") != entry.get("redirect_uri", ""):
         return JSONResponse(
             {"error": "invalid_grant", "error_description": "redirect_uri mismatch"},
             status_code=400,
         )
 
-    # client_id binding (informational — public client, but bind regardless).
     if entry.get("client_id") and (client_id or "") != entry["client_id"]:
         return JSONResponse(
             {"error": "invalid_grant", "error_description": "client_id mismatch"},
             status_code=400,
         )
 
-    # PKCE: every code carries a challenge now (enforced at /auth/authorize
-    # and /auth/login), so code_verifier is always required.
     stored_challenge = entry.get("code_challenge", "")
     if not stored_challenge:
         return JSONResponse(
@@ -398,12 +458,39 @@ async def token(
             status_code=400,
         )
 
-    access_token, expires_in = issue_token(entry["session"])
+    access_token, refresh_token, ttl = await _issue_token_pair(entry["session"])
+    audit("token_issued", login=entry["session"].redmine_login, grant="authorization_code")
     return JSONResponse(
         {
             "access_token": access_token,
+            "refresh_token": refresh_token,
             "token_type": "bearer",
-            "expires_in": expires_in,
+            "expires_in": ttl,
+        }
+    )
+
+
+async def _grant_refresh_token(*, refresh_token: Optional[str]) -> JSONResponse:
+    """RFC 6749 §6 with rotation: each redeemed refresh token is invalidated
+    and a brand-new one is issued. A leaked refresh token is good for one use
+    at most."""
+    if not refresh_token:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "refresh_token required"},
+            status_code=400,
+        )
+    session = await get_store().pop_refresh(refresh_token)
+    if session is None:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+    access_token, new_refresh_token, ttl = await _issue_token_pair(session)
+    audit("token_refreshed", login=session.redmine_login)
+    return JSONResponse(
+        {
+            "access_token": access_token,
+            "refresh_token": new_refresh_token,
+            "token_type": "bearer",
+            "expires_in": ttl,
         }
     )
 
@@ -417,9 +504,10 @@ async def revoke(
     token: str = Form(...),
     token_type_hint: Optional[str] = Form(None),
 ):
-    # RFC 7009: respond 200 regardless of whether the token existed.
-    revoke_token(token)
-    purge_expired()
+    store = get_store()
+    await store.delete_session(token)
+    await store.purge_expired_sessions()
+    audit("token_revoked")
     return Response(status_code=200)
 
 
@@ -430,10 +518,12 @@ async def revoke(
 @router.post("/oauth/register")
 async def register(request: Request):
     """Accept a public-client registration, persist redirect_uris, return a
-    fresh client_id. We do not authenticate clients — Redmine API key remains
-    the real credential — but we DO bind redirect_uris so that an attacker
-    can't add an arbitrary redirect_uri after the fact.
+    fresh client_id.
     """
+    rl = await _check_rate_limit(request, "register", settings.rate_register_per_minute, 60)
+    if rl is not None:
+        return rl
+
     try:
         body = await request.json()
     except Exception:
@@ -449,7 +539,6 @@ async def register(request: Request):
             status_code=400,
         )
 
-    # Reject anything that isn't an http(s) URL.
     for u in redirect_uris:
         sch = urlparse(u).scheme.lower()
         if sch not in ("http", "https"):
@@ -460,10 +549,10 @@ async def register(request: Request):
 
     client_id = secrets.token_urlsafe(16)
     now = int(time.time())
-    _clients[client_id] = {
+    await get_store().put_client(client_id, {
         "redirect_uris": list(redirect_uris),
         "created_at": now,
-    }
+    })
 
     response = {
         "client_id": client_id,
@@ -493,7 +582,7 @@ async def oauth_metadata(request: Request):
         "revocation_endpoint": f"{base}/oauth/revoke",
         "registration_endpoint": f"{base}/oauth/register",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
     })

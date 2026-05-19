@@ -10,8 +10,11 @@ Auth flow (Option B):
 Run:
   uvicorn server:app --host 0.0.0.0 --port 8000
 """
+import logging
+from contextlib import asynccontextmanager
+from typing import Any, Literal, Optional
+
 import httpx
-from typing import Any, Optional
 
 from fastapi import FastAPI
 from fastmcp import FastMCP
@@ -19,16 +22,21 @@ from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_access_token
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from auth.security import (
     InvalidRedmineURL,
     SECURITY_HEADERS,
     validate_redmine_url,
 )
-from auth.store import lookup_token, UserSession
+from auth.store import UserSession
+from auth.token_store import build_store, get_store, set_store
 from auth.routes import router as auth_router
-from config import settings
+from audit import RequestIDMiddleware, audit, configure_audit_logging
+from config import VERSION, settings
+from errors import ConfirmationRequired, RedmineAPIError
+
+configure_audit_logging()
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +45,7 @@ from config import settings
 
 class RedmineTokenVerifier(TokenVerifier):
     async def verify_token(self, token: str) -> Optional[AccessToken]:
-        session = lookup_token(token)
+        session = await get_store().get_session(token)
         if session is None:
             return None
         return AccessToken(
@@ -62,11 +70,11 @@ mcp = FastMCP(
 # resolves it to a UserSession from our in-memory store.
 # ---------------------------------------------------------------------------
 
-def _session() -> UserSession:
+async def _session() -> UserSession:
     token = get_access_token()
     if token is None:
         raise PermissionError("Not authenticated")
-    session = lookup_token(token.token)
+    session = await get_store().get_session(token.token)
     if session is None:
         raise PermissionError("Session not found")
     return session
@@ -75,6 +83,20 @@ def _session() -> UserSession:
 # ---------------------------------------------------------------------------
 # Redmine HTTP helper — per-request, uses token-bound credentials
 # ---------------------------------------------------------------------------
+
+_redmine_log = logging.getLogger("redmine_mcp.redmine")
+
+# Redmine's REST API caps `limit` at 100 server-side; values above are
+# silently clamped, so just clamp client-side too for predictable behavior.
+_REDMINE_MAX_LIMIT = 100
+
+
+def _clamp_limit(limit: int) -> int:
+    return max(1, min(int(limit), _REDMINE_MAX_LIMIT))
+
+
+import time as _time  # avoid shadowing the kwarg name `time` elsewhere
+
 
 async def _redmine(
     method: str,
@@ -88,6 +110,10 @@ async def _redmine(
     try:
         safe_base = validate_redmine_url(session.redmine_url)
     except InvalidRedmineURL as e:
+        audit(
+            "redmine_call_blocked",
+            login=session.redmine_login, method=method, path=path, reason=str(e),
+        )
         raise PermissionError(f"Refusing outbound call: {e}") from e
 
     url = f"{safe_base}{path}"
@@ -95,15 +121,61 @@ async def _redmine(
         "X-Redmine-API-Key": session.redmine_api_key.reveal(),
         "Content-Type": "application/json",
     }
+    started = _time.monotonic()
     async with httpx.AsyncClient(
         timeout=settings.redmine_timeout_seconds,
         follow_redirects=False,
     ) as client:
         resp = await client.request(method, url, headers=headers, params=params, json=json)
-    resp.raise_for_status()
-    if resp.content:
-        return resp.json()
-    return {}
+    latency_ms = int((_time.monotonic() - started) * 1000)
+
+    audit(
+        "redmine_call",
+        login=session.redmine_login,
+        method=method, path=path,
+        status=resp.status_code,
+        latency_ms=latency_ms,
+    )
+
+    if resp.is_success:
+        if resp.content:
+            return resp.json()
+        return {}
+
+    # Non-2xx: convert the raw httpx error into a sanitized RedmineAPIError.
+    # Raw Redmine bodies can leak version banners, plugin names, or stack
+    # traces — those go to server logs only, never the MCP client.
+    body_text = resp.text or ""
+    status = resp.status_code
+
+    if status in (401, 403):
+        _redmine_log.warning("redmine %d on %s %s", status, method, path)
+        raise RedmineAPIError("Permission denied.", status_code=status,
+                              upstream_body=body_text)
+    if status == 404:
+        raise RedmineAPIError("Not found.", status_code=404,
+                              upstream_body=body_text)
+    if status == 422:
+        errors_list: list[str] = []
+        try:
+            errors_list = list(resp.json().get("errors", []))
+        except Exception:
+            pass
+        msg = "Validation failed: " + ("; ".join(errors_list) if errors_list else "no details")
+        raise RedmineAPIError(
+            msg, status_code=422,
+            upstream_body=body_text,
+            validation_errors=errors_list,
+        )
+    if 500 <= status < 600:
+        _redmine_log.error(
+            "redmine %d on %s %s: %s", status, method, path, body_text[:500]
+        )
+        raise RedmineAPIError("Upstream Redmine error.", status_code=status,
+                              upstream_body=body_text)
+    raise RedmineAPIError(
+        f"Redmine returned {status}.", status_code=status, upstream_body=body_text
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +189,9 @@ async def list_projects(
     status: Optional[str] = None,
     include: Optional[str] = None,
 ) -> dict:
-    """List all accessible Redmine projects."""
-    s = _session()
-    p = {"limit": limit, "offset": offset}
+    """List all accessible Redmine projects. `limit` clamped to 1..100."""
+    s = await _session()
+    p = {"limit": _clamp_limit(limit), "offset": offset}
     if status: p["status"] = status
     if include: p["include"] = include
     return await _redmine("GET", s, "/projects.json", params=p)
@@ -128,7 +200,7 @@ async def list_projects(
 @mcp.tool()
 async def get_project(id: str, include: Optional[str] = None) -> dict:
     """Get a specific Redmine project by ID or identifier."""
-    s = _session()
+    s = await _session()
     p = {"include": include} if include else {}
     return await _redmine("GET", s, f"/projects/{id}.json", params=p)
 
@@ -143,7 +215,7 @@ async def create_project(
     inherit_members: bool = False,
 ) -> dict:
     """Create a new Redmine project."""
-    s = _session()
+    s = await _session()
     body: dict = {"name": name, "identifier": identifier, "is_public": is_public, "inherit_members": inherit_members}
     if description: body["description"] = description
     if parent_id: body["parent_id"] = parent_id
@@ -153,7 +225,7 @@ async def create_project(
 @mcp.tool()
 async def update_project(id: str, updates: dict[str, Any]) -> dict:
     """Update an existing Redmine project (partial update). `updates` is a dict of fields to change."""
-    s = _session()
+    s = await _session()
     return await _redmine("PUT", s, f"/projects/{id}.json", json={"project": updates})
 
 
@@ -161,8 +233,8 @@ async def update_project(id: str, updates: dict[str, Any]) -> dict:
 async def delete_project(id: str, confirm: bool = False) -> dict:
     """Delete a Redmine project. confirm must be true."""
     if not confirm:
-        return {"error": "Set confirm=true to delete the project."}
-    s = _session()
+        raise ConfirmationRequired("Set confirm=true to delete the project.")
+    s = await _session()
     return await _redmine("DELETE", s, f"/projects/{id}.json")
 
 
@@ -182,23 +254,29 @@ async def list_issues(
     offset: int = 0,
     include: Optional[str] = None,
 ) -> dict:
-    """List Redmine issues with filtering and pagination."""
-    s = _session()
-    p: dict = {"limit": limit, "offset": offset}
-    if project_id: p["project_id"] = project_id
-    if tracker_id: p["tracker_id"] = tracker_id
-    if status_id: p["status_id"] = status_id
-    if assigned_to_id: p["assigned_to_id"] = assigned_to_id
-    if query_id: p["query_id"] = query_id
-    if sort: p["sort"] = sort
-    if include: p["include"] = include
+    """List Redmine issues with filtering and pagination.
+
+    `status_id` accepts the literal strings ``"open"``, ``"closed"``, ``"*"``,
+    or a Redmine status ID (as a string). `limit` is clamped to 1..100.
+    """
+    s = await _session()
+    p: dict = {"limit": _clamp_limit(limit), "offset": offset}
+    # `is not None` (not truthiness) so legitimate zero / empty-string values
+    # — e.g. status_id="" for "any" — aren't silently dropped.
+    if project_id is not None: p["project_id"] = project_id
+    if tracker_id is not None: p["tracker_id"] = tracker_id
+    if status_id is not None: p["status_id"] = status_id
+    if assigned_to_id is not None: p["assigned_to_id"] = assigned_to_id
+    if query_id is not None: p["query_id"] = query_id
+    if sort is not None: p["sort"] = sort
+    if include is not None: p["include"] = include
     return await _redmine("GET", s, "/issues.json", params=p)
 
 
 @mcp.tool()
 async def get_issue(issue_id: int, include: Optional[str] = None) -> dict:
     """Get a specific Redmine issue."""
-    s = _session()
+    s = await _session()
     p = {"include": include} if include else {}
     return await _redmine("GET", s, f"/issues/{issue_id}.json", params=p)
 
@@ -219,7 +297,7 @@ async def create_issue(
     due_date: Optional[str] = None,
 ) -> dict:
     """Create a new Redmine issue."""
-    s = _session()
+    s = await _session()
     body: dict = {"project_id": project_id, "tracker_id": tracker_id, "subject": subject}
     for k, v in [
         ("description", description), ("status_id", status_id),
@@ -234,7 +312,7 @@ async def create_issue(
 @mcp.tool()
 async def update_issue(issue_id: int, updates: dict[str, Any], notes: Optional[str] = None) -> dict:
     """Update a Redmine issue. `updates` is a dict of issue fields; `notes` is added as a journal comment."""
-    s = _session()
+    s = await _session()
     body = dict(updates)
     if notes: body["notes"] = notes
     return await _redmine("PUT", s, f"/issues/{issue_id}.json", json={"issue": body})
@@ -244,29 +322,29 @@ async def update_issue(issue_id: int, updates: dict[str, Any], notes: Optional[s
 async def delete_issue(issue_id: int, confirm: bool = False) -> dict:
     """Delete a Redmine issue. confirm must be true."""
     if not confirm:
-        return {"error": "Set confirm=true to delete the issue."}
-    s = _session()
+        raise ConfirmationRequired("Set confirm=true to delete the issue.")
+    s = await _session()
     return await _redmine("DELETE", s, f"/issues/{issue_id}.json")
 
 
 @mcp.tool()
 async def add_issue_watcher(issue_id: int, user_id: int) -> dict:
     """Add a watcher to a Redmine issue."""
-    s = _session()
+    s = await _session()
     return await _redmine("POST", s, f"/issues/{issue_id}/watchers.json", json={"user_id": user_id})
 
 
 @mcp.tool()
 async def remove_issue_watcher(issue_id: int, user_id: int) -> dict:
     """Remove a watcher from a Redmine issue."""
-    s = _session()
+    s = await _session()
     return await _redmine("DELETE", s, f"/issues/{issue_id}/watchers/{user_id}.json")
 
 
 @mcp.tool()
 async def get_issue_relations(issue_id: int) -> dict:
     """Get all relations for a Redmine issue."""
-    s = _session()
+    s = await _session()
     return await _redmine("GET", s, f"/issues/{issue_id}/relations.json")
 
 
@@ -274,11 +352,14 @@ async def get_issue_relations(issue_id: int) -> dict:
 async def create_issue_relation(
     issue_id: int,
     issue_to_id: int,
-    relation_type: str,
+    relation_type: Literal[
+        "relates", "duplicates", "duplicated", "blocks", "blocked",
+        "precedes", "follows", "copied_to", "copied_from",
+    ],
     delay: Optional[int] = None,
 ) -> dict:
     """Create a relation between two Redmine issues."""
-    s = _session()
+    s = await _session()
     body: dict = {"issue_to_id": issue_to_id, "relation_type": relation_type}
     if delay is not None: body["delay"] = delay
     return await _redmine("POST", s, f"/issues/{issue_id}/relations.json", json={"relation": body})
@@ -288,15 +369,15 @@ async def create_issue_relation(
 async def delete_issue_relation(relation_id: int, confirm: bool = False) -> dict:
     """Delete a Redmine issue relation. confirm must be true."""
     if not confirm:
-        return {"error": "Set confirm=true to delete the issue relation."}
-    s = _session()
+        raise ConfirmationRequired("Set confirm=true to delete the issue relation.")
+    s = await _session()
     return await _redmine("DELETE", s, f"/relations/{relation_id}.json")
 
 
 @mcp.tool()
 async def get_issue_journals(issue_id: int) -> dict:
     """Get the change history (journals) for a Redmine issue."""
-    s = _session()
+    s = await _session()
     result = await _redmine("GET", s, f"/issues/{issue_id}.json", params={"include": "journals"})
     return {"journals": result.get("issue", {}).get("journals", [])}
 
@@ -310,7 +391,7 @@ async def copy_issue(
     copy_watchers: bool = False,
 ) -> dict:
     """Copy a Redmine issue."""
-    s = _session()
+    s = await _session()
     body: dict = {"copy_from": issue_id, "copy_attachments": copy_attachments,
                   "copy_subtasks": copy_subtasks, "copy_watchers": copy_watchers}
     if project_id: body["project_id"] = project_id
@@ -320,7 +401,7 @@ async def copy_issue(
 @mcp.tool()
 async def move_issue(issue_id: int, project_id: str, tracker_id: Optional[int] = None) -> dict:
     """Move a Redmine issue to another project."""
-    s = _session()
+    s = await _session()
     body: dict = {"project_id": project_id}
     if tracker_id: body["tracker_id"] = tracker_id
     return await _redmine("PUT", s, f"/issues/{issue_id}.json", json={"issue": body})
@@ -338,9 +419,9 @@ async def list_users(
     name: Optional[str] = None,
     group_id: Optional[int] = None,
 ) -> dict:
-    """List Redmine users (requires admin)."""
-    s = _session()
-    p: dict = {"limit": limit, "offset": offset, "status": status}
+    """List Redmine users (requires admin). `limit` clamped to 1..100."""
+    s = await _session()
+    p: dict = {"limit": _clamp_limit(limit), "offset": offset, "status": status}
     if name: p["name"] = name
     if group_id: p["group_id"] = group_id
     return await _redmine("GET", s, "/users.json", params=p)
@@ -349,7 +430,7 @@ async def list_users(
 @mcp.tool()
 async def get_user(user_id: str, include: Optional[str] = None) -> dict:
     """Get a Redmine user. Use 'current' for the authenticated user."""
-    s = _session()
+    s = await _session()
     p = {"include": include} if include else {}
     return await _redmine("GET", s, f"/users/{user_id}.json", params=p)
 
@@ -367,7 +448,7 @@ async def create_user(
     admin: bool = False,
 ) -> dict:
     """Create a Redmine user (requires admin)."""
-    s = _session()
+    s = await _session()
     body: dict = {"login": login, "firstname": firstname, "lastname": lastname, "mail": mail,
                   "must_change_password": must_change_password, "generate_password": generate_password,
                   "send_information": send_information, "admin": admin}
@@ -378,7 +459,7 @@ async def create_user(
 @mcp.tool()
 async def update_user(user_id: int, updates: dict[str, Any]) -> dict:
     """Update a Redmine user. `updates` is a dict of user fields to change."""
-    s = _session()
+    s = await _session()
     return await _redmine("PUT", s, f"/users/{user_id}.json", json={"user": updates})
 
 
@@ -386,8 +467,8 @@ async def update_user(user_id: int, updates: dict[str, Any]) -> dict:
 async def delete_user(user_id: int, confirm: bool = False) -> dict:
     """Delete a Redmine user (requires admin). confirm must be true."""
     if not confirm:
-        return {"error": "Set confirm=true to delete the user."}
-    s = _session()
+        raise ConfirmationRequired("Set confirm=true to delete the user.")
+    s = await _session()
     return await _redmine("DELETE", s, f"/users/{user_id}.json")
 
 
@@ -406,19 +487,19 @@ async def list_time_entries(
     limit: int = 25,
     offset: int = 0,
 ) -> dict:
-    """List Redmine time entries with optional filters."""
-    s = _session()
-    p: dict = {"limit": limit, "offset": offset}
+    """List Redmine time entries with optional filters. `limit` clamped to 1..100."""
+    s = await _session()
+    p: dict = {"limit": _clamp_limit(limit), "offset": offset}
     for k, v in [("user_id", user_id), ("project_id", project_id), ("issue_id", issue_id),
                  ("spent_on", spent_on), ("from", from_date), ("to", to_date)]:
-        if v: p[k] = v
+        if v is not None: p[k] = v
     return await _redmine("GET", s, "/time_entries.json", params=p)
 
 
 @mcp.tool()
 async def get_time_entry(time_entry_id: int) -> dict:
     """Get a specific Redmine time entry."""
-    s = _session()
+    s = await _session()
     return await _redmine("GET", s, f"/time_entries/{time_entry_id}.json")
 
 
@@ -432,7 +513,7 @@ async def create_time_entry(
     comments: Optional[str] = None,
 ) -> dict:
     """Log time on a Redmine issue or project."""
-    s = _session()
+    s = await _session()
     body: dict = {"hours": hours, "activity_id": activity_id}
     for k, v in [("issue_id", issue_id), ("project_id", project_id),
                  ("spent_on", spent_on), ("comments", comments)]:
@@ -443,7 +524,7 @@ async def create_time_entry(
 @mcp.tool()
 async def update_time_entry(time_entry_id: int, updates: dict[str, Any]) -> dict:
     """Update a Redmine time entry. `updates` is a dict of fields to change."""
-    s = _session()
+    s = await _session()
     return await _redmine("PUT", s, f"/time_entries/{time_entry_id}.json", json={"time_entry": updates})
 
 
@@ -451,8 +532,8 @@ async def update_time_entry(time_entry_id: int, updates: dict[str, Any]) -> dict
 async def delete_time_entry(time_entry_id: int, confirm: bool = False) -> dict:
     """Delete a Redmine time entry. confirm must be true."""
     if not confirm:
-        return {"error": "Set confirm=true to delete the time entry."}
-    s = _session()
+        raise ConfirmationRequired("Set confirm=true to delete the time entry.")
+    s = await _session()
     return await _redmine("DELETE", s, f"/time_entries/{time_entry_id}.json")
 
 
@@ -463,22 +544,22 @@ async def delete_time_entry(time_entry_id: int, confirm: bool = False) -> dict:
 @mcp.tool()
 async def list_memberships(project_id: int, limit: int = 25, offset: int = 0) -> dict:
     """List memberships for a Redmine project."""
-    s = _session()
+    s = await _session()
     return await _redmine("GET", s, f"/projects/{project_id}/memberships.json",
-                          params={"limit": limit, "offset": offset})
+                          params={"limit": _clamp_limit(limit), "offset": offset})
 
 
 @mcp.tool()
 async def get_membership(membership_id: int) -> dict:
     """Get a specific Redmine project membership."""
-    s = _session()
+    s = await _session()
     return await _redmine("GET", s, f"/memberships/{membership_id}.json")
 
 
 @mcp.tool()
 async def create_membership(project_id: int, user_id: int, role_ids: list[int]) -> dict:
     """Add a user or group to a Redmine project."""
-    s = _session()
+    s = await _session()
     return await _redmine("POST", s, f"/projects/{project_id}/memberships.json",
                           json={"membership": {"user_id": user_id, "role_ids": role_ids}})
 
@@ -486,7 +567,7 @@ async def create_membership(project_id: int, user_id: int, role_ids: list[int]) 
 @mcp.tool()
 async def update_membership(membership_id: int, role_ids: list[int]) -> dict:
     """Update roles for a Redmine project membership."""
-    s = _session()
+    s = await _session()
     return await _redmine("PUT", s, f"/memberships/{membership_id}.json",
                           json={"membership": {"role_ids": role_ids}})
 
@@ -495,8 +576,8 @@ async def update_membership(membership_id: int, role_ids: list[int]) -> dict:
 async def delete_membership(membership_id: int, confirm: bool = False) -> dict:
     """Remove a user from a Redmine project. confirm must be true."""
     if not confirm:
-        return {"error": "Set confirm=true to delete the membership."}
-    s = _session()
+        raise ConfirmationRequired("Set confirm=true to delete the membership.")
+    s = await _session()
     return await _redmine("DELETE", s, f"/memberships/{membership_id}.json")
 
 
@@ -507,14 +588,14 @@ async def delete_membership(membership_id: int, confirm: bool = False) -> dict:
 @mcp.tool()
 async def list_groups() -> dict:
     """List all Redmine groups (requires admin)."""
-    s = _session()
+    s = await _session()
     return await _redmine("GET", s, "/groups.json")
 
 
 @mcp.tool()
 async def get_group(group_id: int, include: Optional[str] = None) -> dict:
     """Get a specific Redmine group."""
-    s = _session()
+    s = await _session()
     p = {"include": include} if include else {}
     return await _redmine("GET", s, f"/groups/{group_id}.json", params=p)
 
@@ -522,7 +603,7 @@ async def get_group(group_id: int, include: Optional[str] = None) -> dict:
 @mcp.tool()
 async def create_group(name: str, user_ids: Optional[list[int]] = None) -> dict:
     """Create a Redmine group."""
-    s = _session()
+    s = await _session()
     body: dict = {"name": name}
     if user_ids: body["user_ids"] = user_ids
     return await _redmine("POST", s, "/groups.json", json={"group": body})
@@ -531,7 +612,7 @@ async def create_group(name: str, user_ids: Optional[list[int]] = None) -> dict:
 @mcp.tool()
 async def update_group(group_id: int, name: Optional[str] = None, user_ids: Optional[list[int]] = None) -> dict:
     """Update a Redmine group."""
-    s = _session()
+    s = await _session()
     body: dict = {}
     if name: body["name"] = name
     if user_ids is not None: body["user_ids"] = user_ids
@@ -542,8 +623,8 @@ async def update_group(group_id: int, name: Optional[str] = None, user_ids: Opti
 async def delete_group(group_id: int, confirm: bool = False) -> dict:
     """Delete a Redmine group. confirm must be true."""
     if not confirm:
-        return {"error": "Set confirm=true to delete the group."}
-    s = _session()
+        raise ConfirmationRequired("Set confirm=true to delete the group.")
+    s = await _session()
     return await _redmine("DELETE", s, f"/groups/{group_id}.json")
 
 
@@ -554,14 +635,14 @@ async def delete_group(group_id: int, confirm: bool = False) -> dict:
 @mcp.tool()
 async def list_versions(project_id: int) -> dict:
     """List versions/milestones for a Redmine project."""
-    s = _session()
+    s = await _session()
     return await _redmine("GET", s, f"/projects/{project_id}/versions.json")
 
 
 @mcp.tool()
 async def get_version(version_id: int) -> dict:
     """Get a specific Redmine version."""
-    s = _session()
+    s = await _session()
     return await _redmine("GET", s, f"/versions/{version_id}.json")
 
 
@@ -570,12 +651,12 @@ async def create_version(
     project_id: int,
     name: str,
     description: Optional[str] = None,
-    status: str = "open",
+    status: Literal["open", "locked", "closed"] = "open",
     due_date: Optional[str] = None,
-    sharing: str = "none",
+    sharing: Literal["none", "descendants", "hierarchy", "tree", "system"] = "none",
 ) -> dict:
     """Create a Redmine version/milestone."""
-    s = _session()
+    s = await _session()
     body: dict = {"name": name, "status": status, "sharing": sharing}
     if description: body["description"] = description
     if due_date: body["due_date"] = due_date
@@ -585,7 +666,7 @@ async def create_version(
 @mcp.tool()
 async def update_version(version_id: int, updates: dict[str, Any]) -> dict:
     """Update a Redmine version. `updates` is a dict of fields to change."""
-    s = _session()
+    s = await _session()
     return await _redmine("PUT", s, f"/versions/{version_id}.json", json={"version": updates})
 
 
@@ -593,8 +674,8 @@ async def update_version(version_id: int, updates: dict[str, Any]) -> dict:
 async def delete_version(version_id: int, confirm: bool = False) -> dict:
     """Delete a Redmine version. confirm must be true."""
     if not confirm:
-        return {"error": "Set confirm=true to delete the version."}
-    s = _session()
+        raise ConfirmationRequired("Set confirm=true to delete the version.")
+    s = await _session()
     return await _redmine("DELETE", s, f"/versions/{version_id}.json")
 
 
@@ -605,7 +686,7 @@ async def delete_version(version_id: int, confirm: bool = False) -> dict:
 @mcp.tool()
 async def list_custom_fields() -> dict:
     """List all Redmine custom fields."""
-    s = _session()
+    s = await _session()
     return await _redmine("GET", s, "/custom_fields.json")
 
 
@@ -615,9 +696,9 @@ async def list_custom_fields() -> dict:
 
 @mcp.tool()
 async def list_queries(limit: int = 25, offset: int = 0) -> dict:
-    """List all accessible Redmine saved queries."""
-    s = _session()
-    return await _redmine("GET", s, "/queries.json", params={"limit": limit, "offset": offset})
+    """List all accessible Redmine saved queries. `limit` clamped to 1..100."""
+    s = await _session()
+    return await _redmine("GET", s, "/queries.json", params={"limit": _clamp_limit(limit), "offset": offset})
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +707,20 @@ async def list_queries(limit: int = 25, offset: int = 0) -> dict:
 
 mcp_app = mcp.http_app(path="/", transport="streamable-http")
 
-app = FastAPI(title="Redmine MCP OAuth Server", lifespan=mcp_app.lifespan)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Build the token store before any request is served, tear it down on exit."""
+    store = await build_store()
+    set_store(store)
+    try:
+        async with mcp_app.lifespan(app):
+            yield
+    finally:
+        await store.close()
+
+
+app = FastAPI(title="Redmine MCP OAuth Server", lifespan=lifespan)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -640,6 +734,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestIDMiddleware)
 app.include_router(auth_router)
 
 
@@ -649,11 +744,23 @@ async def healthz() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/version", include_in_schema=False)
+async def version() -> dict:
+    """Build version (matches the plan-phase number in TODO.md / CHANGELOG.md)."""
+    return {"version": VERSION}
+
+
 @app.get("/readyz", include_in_schema=False)
-async def readyz() -> dict:
-    """Readiness probe. Currently identical to healthz; will check the token
-    store backend once a remote backend is wired up (Phase 1.1)."""
-    return {"status": "ready"}
+async def readyz() -> Response:
+    """Readiness probe. Pings the token-store backend (no-op in memory,
+    real ping for Redis). Returns 503 if the backend is unreachable."""
+    try:
+        ok = await get_store().ping()
+    except Exception:
+        ok = False
+    if not ok:
+        return JSONResponse({"status": "unavailable"}, status_code=503)
+    return JSONResponse({"status": "ready"})
 
 
 app.mount("/mcp", mcp_app)

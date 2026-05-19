@@ -1,98 +1,93 @@
 # TODO — remaining work
 
-Phase 0 (critical security) is **complete**: see `SECURITY.md` for the
-defects fixed. This document tracks everything from the original review plan
-that is still open, grouped by phase. Items inside a phase are roughly in
-dependency / priority order.
+**Current version: 1.7** — see [`CHANGELOG.md`](./CHANGELOG.md) for the
+release history, [`SECURITY.md`](./SECURITY.md) for the threat model and
+the Phase 0 defect-and-fix matrix.
+
+This document tracks everything from the original review plan that is
+still open or partial, grouped by phase. Items inside a phase are roughly
+in dependency / priority order.
 
 Legend: `[ ]` not started · `[~]` partial · `[x]` done (kept for context)
+
+Done so far:
+- **Phase 0** (0.1 – 0.9): critical security hardening — complete
+- **Phase 1** (1.1 – 1.7): all of high-priority hardening — complete
+  - 1.1 pluggable TokenStore (in-memory + Redis with Fernet)
+  - 1.2 refresh tokens with rotation
+  - 1.3 per-IP rate limiting on auth endpoints
+  - 1.4 security headers (brought forward into Phase 0)
+  - 1.5 structured error handling (RedmineAPIError + ConfirmationRequired)
+  - 1.6 input validation (Literal types, limit clamp, truthiness bug fix)
+  - 1.7 structured JSON audit logging + request-ID middleware
 
 ---
 
 ## Phase 1 — High-priority hardening
 
-### 1.1 Pluggable token store (Redis-ready, in-memory default) `[ ]`
-**Files:** `auth/store.py`, new `auth/store_redis.py`, `config.py`
+### 1.1 Pluggable token store (Redis-ready, in-memory default) `[x]`
+**Files:** `auth/token_store.py`, `auth/token_store_redis.py`, `config.py`
 
-- Define `TokenStore` Protocol with `get`, `put`, `delete`, `purge_expired`.
-- `InMemoryTokenStore` (default, identical to today's behavior).
-- `RedisTokenStore` (lazy `import redis.asyncio`; enabled when
-  `REDMINE_MCP_REDIS_URL` is set).
-- Encrypt the API key at rest with `cryptography.Fernet` using
-  `REDMINE_MCP_FERNET_KEY` (generate once, store as Render env var).
-- Migrate `_pending_codes` (`auth/routes.py`) and `_clients` (DCR
-  registrations) into the same abstraction — same lifecycle, same need for
-  cross-restart persistence.
-- Hook `/readyz` to ping the Redis backend.
-- Add `aioredis` (or `redis>=5` with asyncio) and `cryptography` to
-  `requirements.txt`.
+Done. `TokenStore` Protocol covers sessions, OAuth codes, and DCR clients.
+`InMemoryTokenStore` is the zero-deps default; `RedisTokenStore` activates
+when `REDMINE_MCP_REDIS_URL` is set and uses `cryptography.Fernet` with
+`REDMINE_MCP_FERNET_KEY` to encrypt the API key field at rest. `_pending_codes`
+and `_clients` were both migrated to the store. `/readyz` pings the active
+backend (no-op for in-memory, real PING for Redis) and returns 503 on failure.
+`docker-compose.yml` gained an opt-in `redis` profile.
 
-### 1.2 Refresh tokens (RFC 6749 §6) `[ ]`
-**Files:** `auth/routes.py`, `auth/store.py`
+### 1.2 Refresh tokens (RFC 6749 §6) `[x]`
+**Files:** `auth/routes.py`, `auth/token_store.py`
 
-- Issue refresh token alongside access token (30-day default, configurable
-  via `REDMINE_MCP_REFRESH_TTL_SECONDS`).
-- Add `grant_type=refresh_token` branch to `/oauth/token`.
-- **Rotate** the refresh token on each use; revoke the old one. This caps
-  the damage from a leaked refresh token to a single use.
-- Update `/.well-known/oauth-authorization-server` to advertise
-  `grant_types_supported: ["authorization_code", "refresh_token"]`.
+Done. `/oauth/token` (authorization_code) now returns
+`{access_token, refresh_token, expires_in, token_type}`. Refresh tokens have
+a rolling 30-day TTL (`REDMINE_MCP_REFRESH_TTL_SECONDS`) and are **rotated**
+on every use via `pop_refresh` (atomic GETDEL in Redis): redeeming one
+invalidates it and issues a brand-new one, so a leaked refresh token is
+good for at most one use. Metadata advertises both grant types.
 
-### 1.3 Rate limiting `[ ]`
-**Files:** new `auth/ratelimit.py`, `server.py`
+### 1.3 Rate limiting `[x]`
+**Files:** `auth/routes.py`, `auth/token_store.py`, `config.py`
 
-- `slowapi` middleware (FastAPI/Starlette-native).
-- `POST /auth/login`: 5/min per IP, 20/hour per IP.
-- `POST /oauth/token`: 10/min per IP.
-- `POST /oauth/register`: 5/min per IP.
-- Use Redis backend when available (Phase 1.1) so limits work across
-  restarts and any future horizontal scaling.
-- IP source honors `REDMINE_MCP_TRUST_PROXY` (already added in 0.5).
+Done. Hand-rolled fixed-window counter via the TokenStore protocol (atomic
+INCR + EXPIRE NX in Redis, dict + asyncio.Lock in memory). Limits configurable
+via `REDMINE_MCP_RATE_*` env vars; defaults: `/auth/login` 5/min + 20/hour,
+`/oauth/token` 10/min, `/oauth/register` 5/min. Source IP honors
+`REDMINE_MCP_TRUST_PROXY`. Over-limit responses return 429 with `Retry-After`.
 
 ### 1.4 Security headers + HSTS `[x]`
 Brought forward into Phase 0; see `SECURITY.md`.
 
-### 1.5 Structured error handling for MCP tools `[ ]`
-**Files:** `server.py` (`_redmine` helper), new `errors.py`
+### 1.5 Structured error handling for MCP tools `[x]`
+**Files:** `errors.py`, `server.py` (`_redmine` helper)
 
-`resp.raise_for_status()` currently leaks raw Redmine response bodies
-(version banners, plugin names, sometimes stack traces) to the MCP client.
+Done. `_redmine` translates `httpx` non-2xx responses into a `RedmineAPIError`
+with a short, sanitized message (401/403 → "Permission denied"; 404 → "Not
+found"; 422 → validation errors; 5xx → "Upstream Redmine error"). Raw
+upstream body kept on the exception for server logs only. All seven
+destructive `delete_*` tools now raise `ConfirmationRequired` when
+`confirm=True` is missing instead of returning an error dict.
 
-- New `RedmineAPIError` exception with sanitized message + HTTP status.
-- Mapping:
-  - 401/403 → `"Permission denied"` (no body).
-  - 404 → `"Not found"`.
-  - 422 → include the validation `errors` array (safe and useful).
-  - 5xx → `"Upstream Redmine error"` + full body logged server-side only.
-- Normalize the `confirm=true` paths (`delete_*`) to raise a typed error
-  instead of returning `{"error": ...}` — consistent surface for MCP clients.
-
-### 1.6 Input validation `[ ]`
+### 1.6 Input validation `[x]`
 **Files:** `server.py`
 
-- Replace `Optional[str]` with `Literal[...]` for fixed vocabularies:
-  - `status_id` for `list_issues`: `Literal["open", "closed", "*"] | int`.
-  - `status` for `create_version`: `Literal["open", "locked", "closed"]`.
-  - `sharing` for `create_version`: `Literal["none", "descendants",
-    "hierarchy", "tree", "system"]`.
-  - `relation_type` for `create_issue_relation`: enumerate the 9 Redmine
-    relation types.
-- Cap `limit` at 100 (Redmine's hard max).
-- **Bug fix:** truthiness checks in `list_issues` (`server.py` ~166-172)
-  and `list_time_entries` (~384-386) use `if v:` which drops `0` and `""`.
-  Switch to `if v is not None:` — matches `create_issue` /
-  `create_time_entry` style.
+Done. `Literal` types pin allowed values for `create_version.status`,
+`create_version.sharing`, and `create_issue_relation.relation_type`.
+`_clamp_limit` enforces 1..100 on every `list_*` tool. The truthiness
+bug in `list_issues` and `list_time_entries` (which dropped `user_id=0`
+and `status_id=""`) was fixed — `if v is not None:` everywhere.
 
-### 1.7 Audit logging `[ ]`
-**File:** new `audit.py`, wired into `auth/routes.py` and `server.py`
+### 1.7 Audit logging `[x]`
+**File:** `audit.py`, wired into `auth/routes.py` and `server.py`
 
-- JSON to stdout (stdlib `logging` with `python-json-logger` or hand-rolled
-  formatter).
-- Events: login attempt (URL, outcome, redacted login, source IP), token
-  issuance / revocation / expiry, every tool call (tool, login, outcome,
-  latency — **never** params or payloads).
-- Include a request ID (generated by middleware) so a single user action
-  can be traced across multiple log lines.
+Done. `audit.py` provides `audit(event, **fields)` which emits one-line
+JSON to stdout via stdlib `logging` (no third-party formatter dep).
+`RequestIDMiddleware` sets an 8-char hex `request_id` per request (or
+honors a trimmed inbound `X-Request-Id` ≤ 64 chars) and echoes
+`X-Request-Id` on every response. Events: `login_ok`, `login_rejected`,
+`token_issued`, `token_refreshed`, `token_revoked`,
+`rate_limit_exceeded`, `redmine_call`, `redmine_call_blocked`. Tool params
+and payloads are never logged.
 
 ---
 
