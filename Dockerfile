@@ -25,7 +25,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN groupadd --gid 1000 app \
     && useradd --uid 1000 --gid 1000 --home /app --no-create-home app
 
-COPY --chown=app:app server.py config.py ./
+COPY --chown=app:app server.py config.py audit.py errors.py ./
 COPY --chown=app:app auth ./auth
 
 USER app
@@ -44,4 +44,5 @@ CMD exec uvicorn server:app \
     --host 0.0.0.0 \
     --port ${PORT:-7860} \
     --proxy-headers \
-    --forwarded-allow-ips '*'
+    --forwarded-allow-ips '*' \
+    --ws none

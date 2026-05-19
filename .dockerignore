@@ -2,6 +2,21 @@ venv
 __pycache__
 *.pyc
 .git
+.gitignore
 .claude
 .DS_Store
 .env
+.env.example
+
+# Test + dev tooling — never shipped to production
+tests
+pytest.ini
+.pytest_cache
+
+# Docs and planning — read on the host, not needed in the container
+CHANGELOG.md
+SECURITY.md
+TODO.md
+LICENSE
+docker-compose.yml
+render.yaml

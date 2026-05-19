@@ -109,6 +109,45 @@ async def test_inmem_ping():
 _REDIS_URL = os.getenv("REDMINE_MCP_TEST_REDIS_URL")
 
 
+# ---------------------------------------------------------------------------
+# build_store — error UX
+# ---------------------------------------------------------------------------
+
+class _FakeSettings:
+    """Lightweight stand-in for the frozen Settings dataclass in build_store tests."""
+    def __init__(self, redis_url: str, fernet_key: str) -> None:
+        self.redis_url = redis_url
+        self.fernet_key = fernet_key
+
+
+@pytest.mark.asyncio
+async def test_build_store_rejects_placeholder_fernet_key(monkeypatch):
+    """A non-base64 string in REDMINE_MCP_FERNET_KEY should produce a clear
+    'not a valid Fernet key' error, not the cryptic raw cryptography error."""
+    from auth import token_store as ts_mod
+
+    monkeypatch.setattr(
+        ts_mod, "settings",
+        _FakeSettings(redis_url="redis://nowhere:6379/0", fernet_key="JustATest9876543"),
+    )
+
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        await ts_mod.build_store()
+
+
+@pytest.mark.asyncio
+async def test_build_store_says_missing_fernet_key_explicitly(monkeypatch):
+    from auth import token_store as ts_mod
+
+    monkeypatch.setattr(
+        ts_mod, "settings",
+        _FakeSettings(redis_url="redis://nowhere:6379/0", fernet_key=""),
+    )
+
+    with pytest.raises(RuntimeError, match="REDMINE_MCP_FERNET_KEY is missing"):
+        await ts_mod.build_store()
+
+
 @pytest.mark.asyncio
 @pytest.mark.skipif(not _REDIS_URL, reason="set REDMINE_MCP_TEST_REDIS_URL to enable")
 async def test_redis_session_roundtrip_and_encryption():

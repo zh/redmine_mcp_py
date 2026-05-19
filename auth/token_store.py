@@ -195,13 +195,31 @@ async def build_store() -> TokenStore:
             "and set it as an env var (do NOT commit it)."
         )
 
+    # Validate key format before reaching out to Redis — Fernet's own error
+    # ("Fernet key must be 32 url-safe base64-encoded bytes.") is technically
+    # correct but cryptic to an operator who just pasted a placeholder.
+    from cryptography.fernet import Fernet
+    try:
+        Fernet(settings.fernet_key.encode("ascii"))
+    except (ValueError, UnicodeEncodeError) as e:
+        raise RuntimeError(
+            "REDMINE_MCP_FERNET_KEY is not a valid Fernet key. "
+            "It must be 32 url-safe base64-encoded bytes — generate one with: "
+            "python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'"
+        ) from e
+
     # Lazy import so the cryptography + redis deps are only required when used.
     from auth.token_store_redis import RedisTokenStore
 
     store = RedisTokenStore(settings.redis_url, settings.fernet_key)
     if not await store.ping():
         await store.close()
-        raise RuntimeError(f"Cannot connect to Redis at {settings.redis_url}")
+        raise RuntimeError(
+            f"Cannot connect to Redis at {settings.redis_url}. "
+            "If you're using docker compose, start the redis sibling with "
+            "`docker compose --profile redis up` — without the profile the "
+            "redis service is not created."
+        )
     return store
 
 
