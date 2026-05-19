@@ -1,6 +1,6 @@
 ---
 title: Redmine MCP
-emoji: <F0><9F><94><A7>
+emoji: 🔧
 colorFrom: blue
 colorTo: indigo
 sdk: docker
