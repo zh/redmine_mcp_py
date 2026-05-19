@@ -130,6 +130,31 @@ def test_authorize_rejects_unregistered_redirect_uri():
     assert "redirect_uri" in resp.json()["error_description"]
 
 
+@pytest.mark.parametrize(
+    "loopback",
+    [
+        "http://127.0.0.1:62439/callback",
+        "http://localhost:8080/callback",
+        "http://[::1]:9000/callback",
+    ],
+)
+def test_authorize_allows_rfc8252_loopback_without_registration(loopback):
+    """Desktop MCP clients use random loopback ports; allow without DCR."""
+    resp = client.get(
+        "/auth/authorize",
+        params={
+            "redirect_uri": loopback,
+            "state": "xyz",
+            "response_type": "code",
+            "client_id": "no-such-client",
+            "code_challenge": "abc",
+            "code_challenge_method": "S256",
+        },
+    )
+    assert resp.status_code == 200
+    assert "Connect to Redmine" in resp.text
+
+
 def test_authorize_accepts_registered_redirect_uri():
     reg = client.post(
         "/oauth/register",
@@ -192,7 +217,7 @@ def test_login_rejects_missing_csrf():
         data={
             "redmine_url": "https://redmine.example.com",
             "api_key": "deadbeef",
-            "redirect_uri": "https://app.example.com/cb",
+            "redirect_uri": "http://localhost:1234/cb",  # loopback allowed
             "state": "xyz",
             "code_challenge": "abc",
             "code_challenge_method": "S256",
@@ -201,7 +226,8 @@ def test_login_rejects_missing_csrf():
         },
     )
     assert resp.status_code == 400
-    assert "CSRF" in resp.json()["error_description"]
+    # Validation failures now re-render the login form with the error visible.
+    assert "Session expired" in resp.text or "reload" in resp.text.lower()
 
 
 def test_login_rejects_mismatched_csrf():

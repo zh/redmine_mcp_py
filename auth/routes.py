@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import secrets
 import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode, urlparse
+
+log = logging.getLogger("redmine_mcp.auth")
 
 from fastapi import APIRouter, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -74,21 +77,36 @@ def _verify_pkce_s256(stored_challenge: str, verifier: str) -> bool:
     return secrets.compare_digest(computed, stored_challenge)
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
 def _redirect_uri_is_allowed(redirect_uri: str, client_id: str) -> bool:
-    """Exact-match redirect_uri against the client's registered list OR the
-    env allowlist for non-registered clients (legacy / public MCP clients).
+    """Decide whether a redirect_uri may receive an authorization code.
+
+    Accepted in this order:
+      1. RFC 8252 loopback (http://127.0.0.1:<port>/..., localhost, ::1) — used
+         by every desktop MCP client (Claude Desktop, Claude Code SDK, ...).
+         The auth code lands on the victim's own machine, so this is safe and
+         standard. Required to survive HF Spaces / Render cold restarts that
+         wipe in-memory DCR state.
+      2. Exact match against the client's registered redirect_uris (set at
+         /oauth/register).
+      3. Exact match against REDMINE_MCP_ALLOWED_REDIRECTS env allowlist.
     """
     if not redirect_uri:
         return False
-    # Block dangerous schemes outright.
-    scheme = urlparse(redirect_uri).scheme.lower()
+    parsed = urlparse(redirect_uri)
+    scheme = parsed.scheme.lower()
     if scheme not in ("https", "http"):
         return False
+
+    host = (parsed.hostname or "").lower()
+    if scheme == "http" and host in _LOOPBACK_HOSTS:
+        return True  # RFC 8252 §7.3
 
     if client_id and client_id in _clients:
         return redirect_uri in _clients[client_id]["redirect_uris"]
 
-    # Fallback: env allowlist. Empty allowlist means "no unregistered clients".
     return redirect_uri in settings.allowed_redirects
 
 
@@ -232,6 +250,26 @@ async def login(
 ):
     cookie_csrf = request.cookies.get(_CSRF_COOKIE_NAME, "")
 
+    def _form_error(message: str, *, log_reason: str) -> HTMLResponse:
+        log.warning(
+            "login rejected: %s (ip=%s, client_id=%s, redirect_uri=%s)",
+            log_reason,
+            _client_ip(request),
+            client_id or "-",
+            redirect_uri or "-",
+        )
+        return _render_form(
+            redirect_uri=redirect_uri,
+            state=state,
+            code_challenge=code_challenge,
+            code_challenge_method="S256",
+            client_id=client_id,
+            csrf_token=_issue_csrf_token(),
+            redmine_url=redmine_url,
+            error=message,
+            status_code=400,
+        )
+
     # Anti-CSRF: form token must match cookie *and* be a valid signed token.
     if (
         not csrf_token
@@ -239,28 +277,29 @@ async def login(
         or not secrets.compare_digest(csrf_token, cookie_csrf)
         or not _verify_csrf_token(csrf_token)
     ):
-        return JSONResponse(
-            {"error": "invalid_request", "error_description": "CSRF check failed"},
-            status_code=400,
+        return _form_error(
+            "Session expired. Please reload the page and try again.",
+            log_reason="csrf_check_failed",
         )
 
     # PKCE still mandatory at this stage (the form carries it through).
     if not code_challenge:
-        return JSONResponse(
-            {"error": "invalid_request", "error_description": "code_challenge is required"},
-            status_code=400,
+        return _form_error(
+            "Missing PKCE challenge — please restart the OAuth flow from the client.",
+            log_reason="missing_pkce",
         )
     if code_challenge_method and code_challenge_method != "S256":
-        return JSONResponse(
-            {"error": "invalid_request", "error_description": "only S256 is supported"},
-            status_code=400,
+        return _form_error(
+            "Only S256 PKCE is supported.",
+            log_reason="bad_pkce_method",
         )
 
     # Redirect-URI must still match the registered list.
     if not _redirect_uri_is_allowed(redirect_uri, client_id):
-        return JSONResponse(
-            {"error": "invalid_request", "error_description": "redirect_uri is not registered"},
-            status_code=400,
+        return _form_error(
+            "This client's callback URL is not allowed. If the server restarted, "
+            "restart the OAuth flow from your MCP client.",
+            log_reason="redirect_uri_rejected",
         )
 
     session = await validate_redmine_credentials(redmine_url, api_key)
@@ -288,6 +327,14 @@ async def login(
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
     }
+
+    log.info(
+        "login ok: login=%s ip=%s client_id=%s redirect_uri=%s",
+        session.redmine_login,
+        _client_ip(request),
+        client_id or "-",
+        redirect_uri,
+    )
 
     params = {"code": code, "state": state}
     return RedirectResponse(f"{redirect_uri}?{urlencode(params)}", status_code=302)
