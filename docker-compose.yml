@@ -1,0 +1,79 @@
+# Local development compose file.
+#
+# Usage:
+#   1. cp .env.example .env
+#   2. Generate a secret and put it in .env:
+#        python -c "import secrets; print(secrets.token_urlsafe(32))"
+#   3. docker compose up --build
+#   4. Open http://localhost:8000/.well-known/oauth-authorization-server
+#      to confirm the server is up; point your MCP client at
+#      http://localhost:8000/mcp
+#
+# For production, use render.yaml (Render) or your platform's equivalent —
+# this file is NOT hardened for public exposure (defaults turn on
+# REDMINE_MCP_ALLOW_HTTP so local http:// Redmines and Secure-cookie-less
+# loopback flows work).
+
+services:
+  redmine-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: redmine-mcp:local
+    container_name: redmine-mcp
+    restart: unless-stopped
+
+    # Host:container. Override via HOST_PORT in .env if 8000 is taken.
+    ports:
+      - "${HOST_PORT:-8000}:7860"
+
+    environment:
+      # ---- required ------------------------------------------------------
+      # Signs CSRF cookies. Compose will refuse to start if this is empty.
+      REDMINE_MCP_SECRET: "${REDMINE_MCP_SECRET:?REDMINE_MCP_SECRET must be set in .env}"
+
+      # ---- security knobs ------------------------------------------------
+      # CSV of Redmine hostnames you trust. Strongest SSRF defense.
+      # Empty = allow any public hostname (private/loopback IPs still blocked).
+      REDMINE_MCP_ALLOWED_HOSTS: "${REDMINE_MCP_ALLOWED_HOSTS:-}"
+
+      # CSV of OAuth redirect_uri values for non-loopback web clients.
+      # Desktop MCP clients (Claude Desktop, Claude Code) use loopback and
+      # don't need this — they're auto-allowed per RFC 8252.
+      REDMINE_MCP_ALLOWED_REDIRECTS: "${REDMINE_MCP_ALLOWED_REDIRECTS:-}"
+
+      # DEV DEFAULT: true so http://localhost:* Redmines work and the CSRF
+      # cookie isn't marked Secure (the browser would reject Secure cookies
+      # served over plain http). Set false for HTTPS-only deployments.
+      REDMINE_MCP_ALLOW_HTTP: "${REDMINE_MCP_ALLOW_HTTP:-true}"
+
+      # Set true only when a reverse proxy sits in front of this container.
+      REDMINE_MCP_TRUST_PROXY: "${REDMINE_MCP_TRUST_PROXY:-false}"
+
+      # ---- lifetimes -----------------------------------------------------
+      REDMINE_MCP_TOKEN_TTL_SECONDS: "${REDMINE_MCP_TOKEN_TTL_SECONDS:-86400}"
+      REDMINE_MCP_CODE_TTL_SECONDS:  "${REDMINE_MCP_CODE_TTL_SECONDS:-300}"
+      REDMINE_MCP_TIMEOUT_SECONDS:   "${REDMINE_MCP_TIMEOUT_SECONDS:-30}"
+
+      # ---- internal ------------------------------------------------------
+      # uvicorn listen port inside the container — keep at 7860.
+      PORT: "7860"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:7860/healthz', timeout=3); sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Useful when running a Redmine container alongside this one: use the
+    # service name as hostname (e.g. http://redmine:3000). Uncomment to wire
+    # up your own Redmine container later.
+    # depends_on:
+    #   - redmine
+
+    # If you need to reach a Redmine running on your host machine (not in
+    # Docker), use http://host.docker.internal:<port> from the form. This
+    # works on macOS and Windows; on Linux add:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
